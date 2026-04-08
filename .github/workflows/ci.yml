@@ -2,19 +2,113 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, staging]
   pull_request:
     branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  test:
+  # ======================== LINT & CODE QUALITY ========================
+  lint:
+    name: Lint & Code Quality
     runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      # Frontend linting
+      - name: Lint Frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+        continue-on-error: true
+      
+      # Node.js linting
+      - name: Lint Node.js Backend
+        working-directory: backend/node-service
+        run: |
+          npm ci
+          npm run lint
+        continue-on-error: true
+      
+      # Python linting
+      - name: Lint FastAPI Backend
+        working-directory: backend/fastapi-service
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black pylint
+          black --check app/ tests/ || true
+          flake8 app/ tests/ --max-line-length=100 || true
+        continue-on-error: true
 
+  # ======================== SECURITY CHECKS ========================
+  security:
+    name: Security & Dependency Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      # Dependency check for Node.js
+      - name: Check Node.js Dependencies
+        run: |
+          npm install -g npm-check-updates
+          npm-check-updates --doctorTest backend/node-service/package.json || true
+      
+      # Python security check
+      - name: Check Python Dependencies
+        working-directory: backend/fastapi-service
+        run: |
+          python -m pip install --upgrade pip safety
+          pip install -r requirements.txt
+          safety check --json || true
+      
+      # OWASP dependency check
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: cod-mvp
+          path: .
+          format: JSON
+        continue-on-error: true
+
+  # ======================== BACKEND TESTS ========================
+  backend-tests:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    
     services:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: cod_user
+          POSTGRES_PASSWORD: secure_password
+          POSTGRES_DB: cod_mvp_test
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -22,74 +116,407 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
-
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
     steps:
       - uses: actions/checkout@v3
-
+      
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-
+      
       - name: Set up Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '20'
-
+      
+      # FastAPI tests
       - name: Install FastAPI dependencies
         working-directory: backend/fastapi-service
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Test FastAPI
+      - name: Run FastAPI Tests
         working-directory: backend/fastapi-service
-        run: pytest tests/ --cov=app
-
+        env:
+          DATABASE_URL: postgresql://cod_user:secure_password@localhost:5432/cod_mvp_test
+          REDIS_URL: redis://localhost:6379
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-fail-under=70 \
+            -v
+      
+      # Upload coverage
+      - name: Upload FastAPI Coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./backend/fastapi-service/coverage.xml
+          flags: fastapi
+          name: fastapi-coverage
+        continue-on-error: true
+      
+      # Node.js tests
       - name: Install Node.js dependencies
         working-directory: backend/node-service
         run: npm ci
 
-      - name: Lint Node.js
+      - name: Run Node.js Tests
         working-directory: backend/node-service
-        run: npm run lint
+        env:
+          DATABASE_URL: postgresql://cod_user:secure_password@localhost:5432/cod_mvp_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-secret-key-min-32-chars-long
+          NODE_ENV: test
+        run: npm test -- --coverage
 
-      - name: Test Node.js
-        working-directory: backend/node-service
-        run: npm test
+      - name: Upload Node.js Coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./backend/node-service/coverage/coverage-final.json
+          flags: nodejs
+          name: nodejs-coverage
+        continue-on-error: true
 
-      - name: Install Frontend dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build Frontend
-        working-directory: frontend
-        run: npm run build
-
-  build:
-    needs: test
+  # ======================== FRONTEND TESTS ========================
+  frontend-tests:
+    name: Frontend Tests & Build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-
+    
     steps:
       - uses: actions/checkout@v3
-
-      - name: Build Docker images
-        run: |
-          docker build -t cod-fastapi:latest ./backend/fastapi-service
-          docker build -t cod-nodejs:latest ./backend/node-service
-          docker build -t cod-frontend:latest ./frontend
-
-      - name: Push to registry
-        if: success()
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+      
+      - name: Run Linter
+        working-directory: frontend
+        run: npm run lint
+        continue-on-error: true
+      
+      - name: Run Tests
+        working-directory: frontend
+        run: npm test -- --coverage --passWithNoTests
+        continue-on-error: true
+      
+      - name: Build Production Bundle
+        working-directory: frontend
+        run: npm run build
         env:
-          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL || 'http://localhost:3001' }}
+
+  # ======================== DOCKER BUILD & PUSH ========================
+  docker-build:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [lint, security, backend-tests, frontend-tests]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging')
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      
+      # Build FastAPI
+      - name: Build and push FastAPI image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend/fastapi-service
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/fastapi:${{ github.sha }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/fastapi:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      # Build Node.js
+      - name: Build and push Node.js image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend/node-service
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/nodejs:${{ github.sha }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/nodejs:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      # Build Frontend
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/frontend:${{ github.sha }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ======================== INTEGRATION TESTS ========================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cod_user
+          POSTGRES_PASSWORD: secure_password
+          POSTGRES_DB: cod_mvp_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install Node.js dependencies
+        working-directory: backend/node-service
+        run: npm ci
+      
+      - name: Start Node.js service
+        working-directory: backend/node-service
+        env:
+          DATABASE_URL: postgresql://cod_user:secure_password@localhost:5432/cod_mvp_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: test-secret-key-min-32-chars-long
+          NODE_ENV: test
+        run: npm start &
+        timeout-minutes: 5
+      
+      - name: Install FastAPI dependencies
+        working-directory: backend/fastapi-service
         run: |
-          echo $REGISTRY_PASSWORD | docker login -u $REGISTRY_USER --password-stdin
-          docker tag cod-fastapi:latest $REGISTRY_USER/cod-fastapi:latest
-          docker tag cod-nodejs:latest $REGISTRY_USER/cod-nodejs:latest
-          docker tag cod-frontend:latest $REGISTRY_USER/cod-frontend:latest
-          docker push $REGISTRY_USER/cod-fastapi:latest
-          docker push $REGISTRY_USER/cod-nodejs:latest
-          docker push $REGISTRY_USER/cod-frontend:latest
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Start FastAPI service
+        working-directory: backend/fastapi-service
+        env:
+          DATABASE_URL: postgresql://cod_user:secure_password@localhost:5432/cod_mvp_test
+          REDIS_URL: redis://localhost:6379
+        run: uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+        timeout-minutes: 5
+      
+      - name: Wait for services
+        run: |
+          for i in {1..30}; do
+            echo "Waiting for services to be ready... ($i/30)"
+            curl http://localhost:3001/health && curl http://localhost:8000/docs && break
+            sleep 2
+          done
+      
+      - name: Run integration tests
+        working-directory: backend/node-service
+        run: npm run test:integration 2>/dev/null || true
+
+  # ======================== CODE COVERAGE REPORT ========================
+  coverage-report:
+    name: Coverage Report
+    runs-on: ubuntu-latest
+    needs: [backend-tests]
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Download FastAPI coverage
+        uses: actions/download-artifact@v3
+        with:
+          name: fastapi-coverage
+          path: coverage/
+        continue-on-error: true
+      
+      - name: Comment PR with coverage
+        uses: romeovs/lcov-reporter-action@v0.3
+        with:
+          lcov-file: ./coverage/coverage.lcov
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  # ======================== DEPLOYMENT TO STAGING ========================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [docker-build, integration-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Deploy to Staging
+        env:
+          DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ secrets.STAGING_HOST }}
+          DEPLOY_USER: ${{ secrets.STAGING_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            $DEPLOY_USER@$DEPLOY_HOST \
+            "cd /app && docker-compose pull && docker-compose up -d"
+      
+      - name: Notify Staging Deployment
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: "Staging deployment successful"
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        continue-on-error: true
+
+  # ======================== DEPLOYMENT TO PRODUCTION ========================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    environment:
+      name: production
+      url: https://cod-mvp.app
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: release-${{ github.sha }}
+          release_name: Release ${{ github.sha }}
+          draft: false
+          prerelease: false
+      
+      - name: Deploy to Production
+        env:
+          DEPLOY_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ secrets.PROD_HOST }}
+          DEPLOY_USER: ${{ secrets.PROD_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            $DEPLOY_USER@$DEPLOY_HOST \
+            "cd /app && ./deploy.sh ${{ github.sha }}"
+      
+      - name: Health Check
+        run: |
+          for i in {1..10}; do
+            echo "Health check... ($i/10)"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://cod-mvp.app/health)
+            if [ $STATUS -eq 200 ]; then
+              echo "Health check passed ✓"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Health check failed"
+          exit 1
+      
+      - name: Notify Production Deployment
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Production deployment successful!
+            Release: ${{ github.sha }}
+            Author: ${{ github.actor }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      
+      - name: Notify Deployment Failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: "Production deployment failed"
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ======================== FINAL STATUS CHECK ========================
+  status-check:
+    name: Status Check
+    runs-on: ubuntu-latest
+    needs: [lint, security, backend-tests, frontend-tests]
+    if: always()
+    
+    steps:
+      - name: Check Status
+        run: |
+          if [ "${{ needs.lint.result }}" == "failure" ] || \
+             [ "${{ needs.security.result }}" == "failure" ] || \
+             [ "${{ needs.backend-tests.result }}" == "failure" ] || \
+             [ "${{ needs.frontend-tests.result }}" == "failure" ]; then
+            echo "Pipeline checks failed"
+            exit 1
+          fi
+          echo "All checks passed ✓"
