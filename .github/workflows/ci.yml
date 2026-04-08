@@ -1,0 +1,95 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install FastAPI dependencies
+        working-directory: backend/fastapi-service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Test FastAPI
+        working-directory: backend/fastapi-service
+        run: pytest tests/ --cov=app
+
+      - name: Install Node.js dependencies
+        working-directory: backend/node-service
+        run: npm ci
+
+      - name: Lint Node.js
+        working-directory: backend/node-service
+        run: npm run lint
+
+      - name: Test Node.js
+        working-directory: backend/node-service
+        run: npm test
+
+      - name: Install Frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build Frontend
+        working-directory: frontend
+        run: npm run build
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Docker images
+        run: |
+          docker build -t cod-fastapi:latest ./backend/fastapi-service
+          docker build -t cod-nodejs:latest ./backend/node-service
+          docker build -t cod-frontend:latest ./frontend
+
+      - name: Push to registry
+        if: success()
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          echo $REGISTRY_PASSWORD | docker login -u $REGISTRY_USER --password-stdin
+          docker tag cod-fastapi:latest $REGISTRY_USER/cod-fastapi:latest
+          docker tag cod-nodejs:latest $REGISTRY_USER/cod-nodejs:latest
+          docker tag cod-frontend:latest $REGISTRY_USER/cod-frontend:latest
+          docker push $REGISTRY_USER/cod-fastapi:latest
+          docker push $REGISTRY_USER/cod-nodejs:latest
+          docker push $REGISTRY_USER/cod-frontend:latest
